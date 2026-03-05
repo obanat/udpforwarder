@@ -10,6 +10,8 @@ import android.net.VpnService;
 import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.preference.PreferenceManager;
+import android.os.Message;
+import android.os.Messenger;
 
 import androidx.core.app.NotificationCompat;
 
@@ -34,6 +36,9 @@ public class UdpFilterVpnService extends VpnService {
     private ParcelFileDescriptor vpnInterface;
     private volatile boolean isRunning = false;
     private static final String SP_KEY_MAC = "mac";
+    private Builder vpnBuilder;
+
+    public static final String EXTRA_MESSENGER = "com.obana.vpnforwarder.EXTRA_MESSENGER";
 
     private static final String REDIS_HOST= "i4free.x3322.net";
     private static final int REDIS_PORT = 38086;
@@ -51,13 +56,26 @@ public class UdpFilterVpnService extends VpnService {
 
     private FileOutputStream vpnOutput;
     private FileInputStream vpnInput;
+    private Messenger activityMessenger;
+    private DatagramSocket forwardSocket;
 
     private final byte[] sourceIp = {(byte)192,(byte)168, 5, (byte)161};
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null) {
+            activityMessenger = intent.getParcelableExtra(EXTRA_MESSENGER);
+            // 检查是否是停止命令
+            if (intent.getBooleanExtra("stop_service", false)) {
+                AppLog.i(TAG, "Received stop command");
+                stopVpn();
+                return START_NOT_STICKY;
+            }
+        }
         if (!isRunning) {
             isRunning = true;
             startForegroundService();
+
             new Thread(this::runVpn).start();
         }
         return START_STICKY;
@@ -88,19 +106,20 @@ public class UdpFilterVpnService extends VpnService {
 
     private void runVpn() {
         // 1. 配置VPN接口
-        Builder builder = new Builder();
-        builder.setSession(LOCAL_VPS_NAME);
-        builder.addAddress(LOCAL_VPS_IP, 32); // 虚拟内部IP
-        builder.addRoute("0.0.0.0", 0);     // 拦截所有IPv4流量
+        vpnBuilder = new Builder();
+        vpnBuilder.setSession(LOCAL_VPS_NAME);
+        vpnBuilder.addAddress(LOCAL_VPS_IP, 32); // 虚拟内部IP
+        vpnBuilder.addRoute("0.0.0.0", 0);     // 拦截所有IPv4流量
         try {
-            vpnInterface = builder.establish();
+
+            vpnInterface = vpnBuilder.establish();
             vpnInput = new FileInputStream(vpnInterface.getFileDescriptor());
             vpnOutput = new FileOutputStream(vpnInterface.getFileDescriptor());
             // 分配缓冲区，MTU通常为1500或更大
             ByteBuffer buffer = ByteBuffer.allocate(32767);
             // 2. 建立转发Socket (IPv6)
             // 注意：必须protect socket，否则会形成环路
-            DatagramSocket forwardSocket = new DatagramSocket();
+            forwardSocket = new DatagramSocket();
             protect(forwardSocket);
             startResponseListener(forwardSocket);//start output thread
 
@@ -115,6 +134,7 @@ public class UdpFilterVpnService extends VpnService {
                 int length = vpnInput.read(buffer.array());
                 if (length > 0) {
                     byte[] rawData = buffer.array();
+                    //动画1
                     // 4. 解析IP头 (简易解析，假设无IP选项)
                     // IP版本号 (高4位)
                     int version = (rawData[0] >> 4) & 0x0F;
@@ -136,6 +156,8 @@ public class UdpFilterVpnService extends VpnService {
                         // 5. 筛选逻辑：UDP协议 且 目标IP匹配
                         // Protocol 17 = UDP
                         if (protocol == 17 && ipMatch) {
+                            // 动画1：接收到匹配的UDP数据包
+                            sendAnimationMessage(MainActivity.MSG_PLAY_ANIMATION_1);
                             //sourceIp[0] = rawData[12];sourceIp[1] = rawData[13];
                             //sourceIp[2] = rawData[14];sourceIp[3] = rawData[15];
                             AppLog.i(TAG,"match 1 udp package, sourceIp:"+sourceIp[0] + "." + sourceIp[1] + "."
@@ -160,6 +182,8 @@ public class UdpFilterVpnService extends VpnService {
                                         FORWARD_PORT
                                 );
                                 forwardSocket.send(sendPacket);
+                                // 动画2：转发数据包成功
+                                sendAnimationMessage(MainActivity.MSG_PLAY_ANIMATION_2);
                                 AppLog.i(TAG,"send 1 udp package, addr:"+forwardAddress + " port:" + FORWARD_PORT
                                         + " len:" + payload.length);
                             }
@@ -178,8 +202,75 @@ public class UdpFilterVpnService extends VpnService {
     }
     @Override
     public void onDestroy() {
+        AppLog.i(TAG, "Stopping VPN service...");
+
+        // 1. 先设置运行标志为false，让线程退出循环
         isRunning = false;
+
+        stopVpn();
         super.onDestroy();
+    }
+
+    private void stopVpn() {
+        AppLog.i(TAG, "stopVpn() called");
+
+        // 1. 设置运行标志为false
+        isRunning = false;
+
+        // 2. 关闭VPN接口
+        if (vpnInterface != null) {
+            try {
+                vpnInterface.close();
+                AppLog.i(TAG, "VPN interface closed");
+            } catch (Exception e) {
+                AppLog.e(TAG, "Error closing VPN interface: " + e.getMessage());
+            }
+            vpnInterface = null;
+        }
+
+        // 3. 关闭VPN输入输出流
+        if (vpnInput != null) {
+            try {
+                vpnInput.close();
+                AppLog.i(TAG, "VPN input stream closed");
+            } catch (Exception e) {
+                AppLog.e(TAG, "Error closing VPN input stream: " + e.getMessage());
+            }
+            vpnInput = null;
+        }
+
+        if (vpnOutput != null) {
+            try {
+                vpnOutput.close();
+                AppLog.i(TAG, "VPN output stream closed");
+            } catch (Exception e) {
+                AppLog.e(TAG, "Error closing VPN output stream: " + e.getMessage());
+            }
+            vpnOutput = null;
+        }
+
+        // 4. 关闭转发Socket
+        if (forwardSocket != null && !forwardSocket.isClosed()) {
+            try {
+                forwardSocket.close();
+                AppLog.i(TAG, "Forward socket closed");
+            } catch (Exception e) {
+                AppLog.e(TAG, "Error closing forward socket: " + e.getMessage());
+            }
+            forwardSocket = null;
+        }
+
+        // 5. 停止前台服务并隐藏通知
+        stopForeground(true);
+        stopSelf();
+
+        // 6. 明确取消通知
+        NotificationManager notificationManager = getSystemService(NotificationManager.class);
+        if (notificationManager != null) {
+            notificationManager.cancel(NOTIFICATION_ID);
+        }
+
+        AppLog.i(TAG, "VPN stopped");
     }
 
 
@@ -242,6 +333,11 @@ public class UdpFilterVpnService extends VpnService {
                     AppLog.i(TAG,"recv 1 udp package, addr:"+sourceIp[0]+"."+sourceIp[1]
                             + " port:" + responsePacket.getPort()
                             + " len:" + dataLen);
+                    if (dataLen <= 0) {
+                        continue;
+                    }
+                    // 动画3：接收到服务器响应
+                    sendAnimationMessage(MainActivity.MSG_PLAY_ANIMATION_3);
                     // 2. 构造IP头 + UDP头 + 数据
                     // 总长度 = 20(IP头) + 8(UDP头) + 数据长度
                     int totalLength = 20 + 8 + dataLen;
@@ -293,13 +389,13 @@ public class UdpFilterVpnService extends VpnService {
                     int udpLen = 8 + dataLen;
                     fakeIpPacket[udpStart + 4] = (byte) (udpLen >> 8);
                     fakeIpPacket[udpStart + 5] = (byte) udpLen;
-                    // UDP Checksum (IPv4 UDP可为0，系统会处理或忽略)
                     fakeIpPacket[udpStart + 6] = 0;
                     fakeIpPacket[udpStart + 7] = 0;
                     // --- 拷贝数据 ---
                     System.arraycopy(responsePacket.getData(), responsePacket.getOffset(), fakeIpPacket, 28, dataLen);
                     // 3. 写入VPN接口，发回给应用
                     if (vpnOutput != null) {
+                        sendAnimationMessage(MainActivity.MSG_PLAY_ANIMATION_4);
                         vpnOutput.write(fakeIpPacket);
                     }
                 }
@@ -308,7 +404,7 @@ public class UdpFilterVpnService extends VpnService {
             }
         }).start();
     }
-    // 简单的IP头校验和计算
+
     private int calculateChecksum(byte[] buf, int len) {
         int sum = 0;
         for (int i = 0; i < len; i += 2) {
@@ -316,7 +412,6 @@ public class UdpFilterVpnService extends VpnService {
             int b2 = (buf[i + 1] & 0xFF);
             sum += (b1 + b2);
         }
-        // 处理溢出
         while ((sum >> 16) > 0) {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
@@ -333,6 +428,17 @@ public class UdpFilterVpnService extends VpnService {
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
                 manager.createNotificationChannel(serviceChannel);
+            }
+        }
+    }
+
+    private void sendAnimationMessage(int what) {
+        if (activityMessenger != null) {
+            Message msg = Message.obtain(null, what);
+            try {
+                activityMessenger.send(msg);
+            } catch (Exception e) {
+                AppLog.e(TAG, "Failed to send animation message: " + e.getMessage());
             }
         }
     }
